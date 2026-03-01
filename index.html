@@ -137,12 +137,9 @@ h1 { font-family: Impact, 'Arial Black', sans-serif; font-size: 42px; letter-spa
   <button class="tempo-btn" id="bpm-down">&lt;</button>
   <div class="bpm-display" id="bpm-display">120</div>
   <button class="tempo-btn" id="bpm-up">&gt;</button>
-  <div class="divider"></div>
   <select class="groove-sel" id="groove-select"></select>
   <div class="divider"></div>
   <button class="t-btn" id="export-btn">REC</button>
-  <div class="divider"></div>
-  <button class="t-btn" id="mic-btn">MIC</button>
   <div class="divider"></div>
   <div class="beat-dots">
     <div class="beat-dot" id="dot-0"></div>
@@ -170,7 +167,7 @@ for (var _i = 0; _i < 6; _i++) {
     index:_i, isBass:_i===3, isOne:_i===4, isLoop:_i===5,
     buffer:null,      // AudioBuffer (real recording for all pads)
     bassNotes:null,   // [{freq,start,dur}] phrase for pad 4 synth
-    state:'empty', offset:0, cut:false, muted:false, halftime:false, dist:false, del:false,
+    state:'empty', offset:0, cut:false, muted:false, halftime:false, dist:false, del:false, activeSrcs:[],
     pcmChunks:[], scriptRecorder:null, muteGain:null,
     analyser:null, analyserSource:null, liveAnimFrame:null, recTimer:null
   });
@@ -552,7 +549,7 @@ function triggerDelay(buffer, vel){
   if(!buffer||!audioCtx) return;
   var ctx=getAudioCtx(), now=ctx.currentTime;
   var stepSec=stepMs()/1000;
-  var gi=parseInt(document.getElementById('groove-select').value)||0;
+  var gi=parseInt(document.getElementById('groove-select').value); if(isNaN(gi)||gi<0) gi=2; // default Funk
   var kickPat=GROOVES[gi].kick;
   // Find all kick steps in the bar and schedule fading repeats
   var repeats=0, maxRepeats=4;
@@ -692,12 +689,27 @@ function triggerPad(idx, vel){
   var src=ctx.createBufferSource(); src.buffer=pad.buffer;
   var gain=ctx.createGain(); gain.gain.value=Math.min(vel,1.0);
   src.connect(gain); gain.connect(dest);
+  // Track for instant mute
+  pad.activeSrcs.push({src:src,gain:gain});
+  src.onended=function(){var i=pad.activeSrcs.findIndex(function(a){return a.src===src;});if(i>=0)pad.activeSrcs.splice(i,1);};
   if(pad.cut){
     var half=pad.buffer.duration*0.5, fadeAt=half*0.8;
     gain.gain.setValueAtTime(vel,now+fadeAt);
     gain.gain.linearRampToValueAtTime(0.0001,now+half);
     src.start(); src.stop(now+half);
   } else { src.start(); }
+
+  // ── Pad 5 (isLoop): sweetener — high sizzle + 2kHz harmonic warmth ──
+  if(idx===5){
+    var hsf=ctx.createBiquadFilter(); hsf.type='highshelf'; hsf.frequency.value=8000; hsf.gain.value=5;
+    var pk2k=ctx.createBiquadFilter(); pk2k.type='peaking'; pk2k.frequency.value=2000; pk2k.Q.value=1.2; pk2k.gain.value=4;
+    var sweet=ctx.createWaveShaper();
+    var sc=new Float32Array(256);
+    for(var si5=0;si5<256;si5++){var xs=(si5/127.5)-1; sc[si5]=xs-(xs*xs*xs)/3;} // soft 3rd-harmonic clip
+    sweet.curve=sc;
+    var sweetGain=ctx.createGain(); sweetGain.gain.value=0.85; // pull back after processing
+    gain.disconnect(); gain.connect(hsf); hsf.connect(pk2k); pk2k.connect(sweet); sweet.connect(sweetGain); sweetGain.connect(dest);
+  }
 
   // ── Pad 4 (isOne): optional bit-crush DIST on sample ──
   if(idx===4&&pads[4]&&pads[4].dist){
@@ -711,21 +723,21 @@ function triggerPad(idx, vel){
     gain.disconnect(); gain.connect(d4); d4.connect(cr4); cr4.connect(postCr4); postCr4.connect(dest);
   }
 
-  // ── Kick (pad 0): add 30% sine sub-thump ──
-  if(idx===0){
+  // ── Kick (pad 0): subtle sine sub-thump, only when real sample loaded ──
+  if(idx===0&&pad.buffer){
     var kickOsc=ctx.createOscillator(), kickEnv=ctx.createGain();
     kickOsc.type='sine';
     kickOsc.frequency.setValueAtTime(120,now);
     kickOsc.frequency.exponentialRampToValueAtTime(40,now+0.12); // pitch drop = thump
     kickEnv.gain.setValueAtTime(0,now);
-    kickEnv.gain.linearRampToValueAtTime(vel*0.24,now+0.004);
+    kickEnv.gain.linearRampToValueAtTime(vel*0.10,now+0.004);
     kickEnv.gain.exponentialRampToValueAtTime(0.001,now+0.18);
     kickOsc.connect(kickEnv); kickEnv.connect(dest);
     kickOsc.start(now); kickOsc.stop(now+0.20);
   }
 
-  // ── Snare (pad 1): add 50% mid crunch (band-passed noise) ──
-  if(idx===1){
+  // ── Snare (pad 1): subtle noise crunch, only when real sample loaded ──
+  if(idx===1&&pad.buffer){
     var bufLen=ctx.sampleRate*0.15;
     var noiseBuffer=ctx.createBuffer(1,bufLen,ctx.sampleRate);
     var nd=noiseBuffer.getChannelData(0);
@@ -735,7 +747,7 @@ function triggerPad(idx, vel){
     bpf.frequency.value=900; bpf.Q.value=0.9; // mid crunch band
     var noiseEnv=ctx.createGain();
     noiseEnv.gain.setValueAtTime(0,now);
-    noiseEnv.gain.linearRampToValueAtTime(vel*0.50,now+0.003);
+    noiseEnv.gain.linearRampToValueAtTime(vel*0.18,now+0.003);
     noiseEnv.gain.exponentialRampToValueAtTime(0.001,now+0.14);
     noise.connect(bpf); bpf.connect(noiseEnv); noiseEnv.connect(dest);
     noise.start(now); noise.stop(now+0.15);
@@ -767,7 +779,7 @@ function tick(){
     var qb=currentStep/4;
     document.querySelectorAll('.beat-dot').forEach(function(d,i){d.classList.toggle('active',i===qb);});
   }
-  var gi=parseInt(document.getElementById('groove-select').value)||0;
+  var gi=parseInt(document.getElementById('groove-select').value); if(isNaN(gi)||gi<0) gi=2; // default Funk
   var groove=GROOVES[gi];
 
   // Pads 0-2
@@ -926,6 +938,17 @@ function buildUI(){
         else if(isBass) bassHoldEnd();
         else padHoldEnd(idx);
       }
+      // Swipe right to clear
+      var swipeStartX=0,swipeStartY=0,swipeActive=false;
+      tap.addEventListener('touchstart',function(e){
+        if(e.touches.length===1){swipeStartX=e.touches[0].clientX;swipeStartY=e.touches[0].clientY;swipeActive=true;}
+      },{passive:true});
+      tap.addEventListener('touchend',function(e){
+        if(!swipeActive) return; swipeActive=false;
+        var dx=e.changedTouches[0].clientX-swipeStartX;
+        var dy=Math.abs(e.changedTouches[0].clientY-swipeStartY);
+        if(dx>60&&dy<40) clearPad(idx);
+      },{passive:true});
       tap.addEventListener('mousedown',  onDown);
       tap.addEventListener('mouseup',    onUp);
       tap.addEventListener('touchstart', onDown,{passive:false});
@@ -938,7 +961,16 @@ function buildUI(){
       if(idx===2){
         // Hi-hat: M | CUT | > (half offset) | < (half-time)
         buttons=[
-          {id:'sub-del-'+idx,   cls:'mute-btn', label:'M',    fn:function(){pads[idx].muted=!pads[idx].muted;updatePadUI(idx);}},
+          {id:'sub-del-'+idx,   cls:'mute-btn', label:'M',    fn:function(){
+              var p=pads[idx]; p.muted=!p.muted;
+              if(p.muted&&p.activeSrcs){
+                p.activeSrcs.forEach(function(a){
+                  try{a.gain.gain.setTargetAtTime(0,getAudioCtx().currentTime,0.005);a.src.stop(getAudioCtx().currentTime+0.02);}catch(e){}
+                });
+                p.activeSrcs=[];
+              }
+              updatePadUI(idx);
+            }},
           {id:'sub-cut-'+idx,   cls:'',         label:'CUT',  fn:function(){pads[idx].cut=!pads[idx].cut;updatePadUI(idx);}},
           {id:'sub-ofs1-'+idx,  cls:'',         label:'>',    fn:function(){pads[idx].offset=pads[idx].offset===2?0:2;updatePadUI(idx);}},
           {id:'sub-ofs2-'+idx,  cls:'',         label:'1/2',  fn:function(){pads[idx].halftime=!pads[idx].halftime;updatePadUI(idx);}},
@@ -946,7 +978,16 @@ function buildUI(){
       } else if(pads[idx]&&pads[idx].isOne){
         // Pad 5 (fires on 1): M | CUT | DIST | DEL
         buttons=[
-          {id:'sub-del-'+idx,   cls:'mute-btn', label:'M',    fn:function(){pads[idx].muted=!pads[idx].muted;updatePadUI(idx);}},
+          {id:'sub-del-'+idx,   cls:'mute-btn', label:'M',    fn:function(){
+              var p=pads[idx]; p.muted=!p.muted;
+              if(p.muted&&p.activeSrcs){
+                p.activeSrcs.forEach(function(a){
+                  try{a.gain.gain.setTargetAtTime(0,getAudioCtx().currentTime,0.005);a.src.stop(getAudioCtx().currentTime+0.02);}catch(e){}
+                });
+                p.activeSrcs=[];
+              }
+              updatePadUI(idx);
+            }},
           {id:'sub-cut-'+idx,   cls:'',         label:'CUT',  fn:function(){pads[idx].cut=!pads[idx].cut;updatePadUI(idx);}},
           {id:'sub-ofs1-'+idx,  cls:'',         label:'DIST', fn:function(){pads[idx].dist=!pads[idx].dist;updatePadUI(idx);}},
           {id:'sub-ofs2-'+idx,  cls:'',         label:'DEL',  fn:function(){pads[idx].del=!pads[idx].del;updatePadUI(idx);}},
@@ -954,7 +995,16 @@ function buildUI(){
       } else if(pads[idx]&&pads[idx].isLoop){
         // Pad 6 (loop): M | E | - | -
         buttons=[
-          {id:'sub-del-'+idx,   cls:'mute-btn', label:'M',    fn:function(){pads[idx].muted=!pads[idx].muted;updatePadUI(idx);}},
+          {id:'sub-del-'+idx,   cls:'mute-btn', label:'M',    fn:function(){
+              var p=pads[idx]; p.muted=!p.muted;
+              if(p.muted&&p.activeSrcs){
+                p.activeSrcs.forEach(function(a){
+                  try{a.gain.gain.setTargetAtTime(0,getAudioCtx().currentTime,0.005);a.src.stop(getAudioCtx().currentTime+0.02);}catch(e){}
+                });
+                p.activeSrcs=[];
+              }
+              updatePadUI(idx);
+            }},
           {id:'sub-cut-'+idx,   cls:'',         label:'E',    fn:function(){pads[idx].cut=!pads[idx].cut;updatePadUI(idx);}},
           {id:'sub-ofs1-'+idx,  cls:'',         label:'·',    fn:function(){}},
           {id:'sub-ofs2-'+idx,  cls:'',         label:'·',    fn:function(){}},
@@ -962,7 +1012,16 @@ function buildUI(){
       } else if(isBass){
         // Bass: M | CUT | > | DIST
         buttons=[
-          {id:'sub-del-'+idx,   cls:'mute-btn', label:'M',    fn:function(){pads[idx].muted=!pads[idx].muted;updatePadUI(idx);}},
+          {id:'sub-del-'+idx,   cls:'mute-btn', label:'M',    fn:function(){
+              var p=pads[idx]; p.muted=!p.muted;
+              if(p.muted&&p.activeSrcs){
+                p.activeSrcs.forEach(function(a){
+                  try{a.gain.gain.setTargetAtTime(0,getAudioCtx().currentTime,0.005);a.src.stop(getAudioCtx().currentTime+0.02);}catch(e){}
+                });
+                p.activeSrcs=[];
+              }
+              updatePadUI(idx);
+            }},
           {id:'sub-cut-'+idx,   cls:'',         label:'CUT',  fn:function(){pads[idx].cut=!pads[idx].cut;updatePadUI(idx);}},
           {id:'sub-ofs1-'+idx,  cls:'',         label:'>',    fn:function(){pads[idx].offset=pads[idx].offset===4?0:4;updatePadUI(idx);}},
           {id:'sub-ofs2-'+idx,  cls:'',         label:'DIST', fn:function(){pads[idx].dist=!pads[idx].dist;updatePadUI(idx);}},
@@ -970,7 +1029,16 @@ function buildUI(){
       } else {
         // Kick/snare: M | CUT | > | >>
         buttons=[
-          {id:'sub-del-'+idx,   cls:'mute-btn', label:'M',    fn:function(){pads[idx].muted=!pads[idx].muted;updatePadUI(idx);}},
+          {id:'sub-del-'+idx,   cls:'mute-btn', label:'M',    fn:function(){
+              var p=pads[idx]; p.muted=!p.muted;
+              if(p.muted&&p.activeSrcs){
+                p.activeSrcs.forEach(function(a){
+                  try{a.gain.gain.setTargetAtTime(0,getAudioCtx().currentTime,0.005);a.src.stop(getAudioCtx().currentTime+0.02);}catch(e){}
+                });
+                p.activeSrcs=[];
+              }
+              updatePadUI(idx);
+            }},
           {id:'sub-cut-'+idx,   cls:'',         label:'CUT',  fn:function(){pads[idx].cut=!pads[idx].cut;updatePadUI(idx);}},
           {id:'sub-ofs1-'+idx,  cls:'',         label:'>',    fn:function(){pads[idx].offset=pads[idx].offset===4?0:4;updatePadUI(idx);}},
           {id:'sub-ofs2-'+idx,  cls:'',         label:'>>',   fn:function(){pads[idx].offset=pads[idx].offset===8?0:8;updatePadUI(idx);}},
@@ -989,8 +1057,15 @@ function buildUI(){
 
 function buildGrooveSelector(){
   var sel=document.getElementById('groove-select');
+  // Placeholder option shown until user picks
+  var ph=document.createElement('option'); ph.value=''; ph.textContent='GROOVE'; ph.disabled=true; ph.selected=true; sel.appendChild(ph);
   GROOVES.forEach(function(g,i){
-    var o=document.createElement('option'); o.value=i; o.textContent=g.name; if(g.name==='Funk') o.selected=true; sel.appendChild(o);
+    var o=document.createElement('option'); o.value=i; o.textContent=g.name; sel.appendChild(o);
+  });
+  // Once user picks, remove placeholder style
+  sel.addEventListener('change',function(){
+    ph.disabled=true; ph.hidden=true;
+    sel.classList.add('groove-set');
   });
 }
 
@@ -1042,8 +1117,8 @@ document.getElementById('export-btn').addEventListener('click',function(){
 });
 buildUI();
 buildGrooveSelector();
-document.addEventListener('click',     function(){getAudioCtx();getMic().then(function(s){if(s)document.getElementById('mic-btn').classList.add('active');});},{once:true});
-document.addEventListener('touchstart',function(){getAudioCtx();getMic().then(function(s){if(s)document.getElementById('mic-btn').classList.add('active');});},{once:true,passive:true});
+document.addEventListener('click',     function(){getAudioCtx();getMic();},{once:true});
+document.addEventListener('touchstart',function(){getAudioCtx();getMic();},{once:true,passive:true});
 
 // Stop sequencer and suspend audio when page goes to background;
 // restart cleanly when it comes back — prevents queued ticks firing all at once
